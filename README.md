@@ -1,5 +1,7 @@
 # crono-mcp (read-only Cronometer MCP)
 
+> **Unofficial.** Not affiliated with or endorsed by Cronometer. Uses undocumented web endpoints that may change; read-only, for accessing your own data.
+
 Lets Claude read your Cronometer diary using the session from your Chrome login.
 **Read-only by construction**: the client can send only two fixed RPCs
 (`authenticate`, `generateAuthorizationToken`) plus `GET /export`. See `src/crono_mcp/client.py`.
