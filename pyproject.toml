@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crono-mcp"
+version = "0.1.0"
+description = "Read-only Cronometer MCP server using your existing Chrome login session"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "mcp>=2.3,<3",
+    "httpx>=0.27.0",
+    "keyring>=25.0.0",
+    "browser-cookie3>=0.19.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+crono-mcp = "crono_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crono_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
