@@ -229,11 +229,38 @@ def test_rpc_params_must_be_ints():
         c._rpc("getFood", food_id="1|2|3")
 
 
-def test_custom_food_amount_shown_in_servings():
-    label = gwt.Food(1, "Label Food", {208: 1.0}, False, True, serving_weight=100.0)
-    s = gwt.Serving(date(2026, 1, 6), 1, 1, None, 150.0, 1, 0)
-    assert diary._amount(s, label) == "1.5 servings"
-    assert diary._amount(s, COFFEE) == "150 g"
+def test_amounts_use_the_logged_measure():
+    label = gwt.Food(1, "Label Food", {208: 1.0}, False, True, measures={7: gwt.Measure("Serving", 1.0, 100.0)})
+    caps = gwt.Food(2, "Capsules", {208: 1.0}, False, False, measures={8: gwt.Measure("capsules", 5.0, 100.0)})
+    noodles = gwt.Food(3, "Noodles", {208: 1.0}, False, False, measures={9: gwt.Measure("cup", 1.0, 176.0)})
+    srv = lambda amount, mid: gwt.Serving(date(2026, 1, 6), 1, 1, None, amount, 0, mid)
+    assert diary._amount(srv(150.0, 7), label) == "1.5 Serving"
+    assert diary._amount(srv(100.0, 8), caps) == "5 capsules"
+    assert diary._amount(srv(220.0, 9), noodles) == "1.25 cup"
+    assert diary._amount(srv(150.0, 99), COFFEE) == "150 g"  # unknown measure: grams
+
+
+# Measure layouts seen in real responses (read order), for food 77 with Nutrient/Integer at 2/3.
+MEASURE_TABLE = ["com.cronometer.shared.foods.models.Food/1", "com.cronometer.shared.foods.models.Nutrient/2",
+                 "java.lang.Integer/3", "com.cronometer.shared.foods.models.Measure/4", "java.util.HashMap/5",
+                 "com.cronometer.shared.localization.Localization/6", "de",
+                 "com.cronometer.shared.foods.models.MeasureTranslation/8", "Tasse",
+                 "com.cronometer.shared.foods.models.Measure$Type/10", "cup", "java.lang.Double/12", "capsules",
+                 "NCCDB:1"]
+
+
+def test_measure_decoding_handles_translations_gram_weights_and_quantity():
+    read = [1, 3, 208, 2, 1.0, 208,
+            # translated: 1 cup = 240 base units, one translation entry
+            4, 1.0, 0, 77, 0, 501, 0, 11, 5, 1, 6, 7, 8, 6, 7, 501, "w$0", 9, 10, 0, 240.0,
+            # boxed gram weight, flag 1, enum back-reference
+            4, 1.0, 1, 77, 0, 502, 12, 240.0, 11, 5, 0, -9, 100.0,
+            # quantity 5 capsules = 100 base units
+            4, 5.0, 0, 77, 0, 503, 0, 13, 5, 0, -9, 100.0]
+    f = gwt.parse_food(gwt_text(read, MEASURE_TABLE), 77)
+    assert f.measures[501] == gwt.Measure("cup", 1.0, 240.0)
+    assert f.measures[502] == gwt.Measure("cup", 1.0, 100.0)
+    assert f.measures[503] == gwt.Measure("capsules", 5.0, 100.0)
 
 
 def test_undecodable_food_is_listed_without_nutrients(tmp_path):
@@ -255,3 +282,15 @@ def test_micronutrient_mismatch_is_caught():
     summed = {208: 100.0, 303: 2.0}
     assert diary.mismatched(summed, {208: 100.0, 303: 2.0}) == []
     assert diary.mismatched(summed, {208: 100.0, 303: 5.0}) == ["Iron (mg)"]
+
+
+def test_unknown_measure_on_cached_food_triggers_one_refetch(tmp_path):
+    cache = FoodCache(tmp_path / "foods.json")
+    cache.put(COFFEE)  # cached copy has no measures
+    current = gwt.Food(100001, "Coffee", COFFEE.nutrients, False, False,
+                       measures={200001: gwt.Measure("mug", 1.0, 400.0)})
+    c = FakeClient({100001: current, 300001: OATS}, OFFICIAL)
+    [day] = diary.food_log(c, cache, date(2026, 1, 5), date(2026, 1, 5))
+    assert day["meals"][0]["foods"][0]["amount"] == "1 mug"
+    assert c.food_calls.count(100001) == 1
+    assert FoodCache(tmp_path / "foods.json").get(100001).measures  # cache updated

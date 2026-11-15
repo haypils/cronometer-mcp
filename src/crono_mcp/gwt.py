@@ -232,6 +232,13 @@ def parse_total_nutrients(text: str) -> Totals:
 
 
 @dataclass
+class Measure:
+    description: str   # e.g. "cup", "medium or grande - each 16 fl oz", "capsules"
+    quantity: float    # how many of `description` the measure stands for (e.g. 5 capsules)
+    weight: float      # base units in one measure
+
+
+@dataclass
 class Food:
     food_id: int
     name: str
@@ -239,7 +246,7 @@ class Food:
     is_recipe: bool
     custom: bool                  # the user's own recipe or custom food: editable, so never cached
     per_unit: bool = False        # Serving Based recipe: values per serving, amount counts servings
-    serving_weight: float | None = None  # custom food: base units in one "Serving" (for display)
+    measures: dict[int, Measure] = field(default_factory=dict)  # measure id -> measure
 
     def scale(self, amount: float) -> float:
         """Factor to multiply nutrient values by for a serving of `amount` base units."""
@@ -248,13 +255,13 @@ class Food:
     def to_json(self) -> dict:
         return {"food_id": self.food_id, "name": self.name, "nutrients": {str(k): v for k, v in self.nutrients.items()},
                 "is_recipe": self.is_recipe, "custom": self.custom, "per_unit": self.per_unit,
-                "serving_weight": self.serving_weight}
+                "measures": {str(k): [m.description, m.quantity, m.weight] for k, m in self.measures.items()}}
 
     @classmethod
     def from_json(cls, d: dict) -> "Food":
         return cls(int(d["food_id"]), d["name"], {int(k): float(v) for k, v in d["nutrients"].items()},
                    bool(d["is_recipe"]), bool(d["custom"]), bool(d.get("per_unit", False)),
-                   d.get("serving_weight"))
+                   {int(k): Measure(str(m[0]), float(m[1]), float(m[2])) for k, m in d.get("measures", {}).items()})
 
 
 _ENGLISH_FLAG = "https://cdn1.cronometer.com/media/flags/us.png"
@@ -285,12 +292,13 @@ def parse_food(text: str, food_id: int) -> Food:
         raise GwtError(f"getFood {food_id}: nutrient list empty")
 
     is_recipe = _class_index(table, "com.cronometer.shared.foods.models.Ingredient/") is not None
+    kind, measures = _measures(tokens, table, food_id)
     per_unit = False
     if is_recipe:
         # Recipe "Serving Sizes" setting: Serving Based -> nutrients per serving and amounts
         # count servings; Weight Based -> per 100 g like any food.
-        kind, weights = _recipe_measures(tokens, table, food_id)
-        per_unit = kind == SERVING_BASED if kind is not None else weights.get("full recipe") == 1.0
+        full = next((m for m in measures.values() if m.description == "full recipe"), None)
+        per_unit = kind == SERVING_BASED if kind is not None else bool(full and full.weight == 1.0)
 
     # Display name: the English translation when there is one (custom foods have none), else
     # the food's own name, which is the first plain string in the table.
@@ -305,39 +313,72 @@ def parse_food(text: str, food_id: int) -> Food:
     # Database foods (NCCDB, CRDB, CFCD, FDC, ...) can't be edited by the user; recipes and
     # custom foods are tagged "Custom" in their source field.
     custom = is_recipe or "Custom" in table
-    serving_weight = None
-    if custom and not is_recipe:  # label-style custom food: show amounts in its "Serving" unit
-        serving_weight = _recipe_measures(tokens, table, food_id)[1].get("Serving") or None
-    return Food(food_id, name, nutrients, is_recipe, custom, per_unit, serving_weight)
+    return Food(food_id, name, nutrients, is_recipe, custom, per_unit, measures)
 
 
 WEIGHT_BASED, SERVING_BASED = 0, 3  # Measure$Type ordinals seen on recipes
 
 
-def _recipe_measures(tokens: list, table: list[str], food_id: int) -> tuple[int | None, dict[str, float]]:
-    """(Measure$Type ordinal, {measure description: weight in base units}) for a recipe or custom
-    food (their measures have no translations; database foods' measures are not decoded).
+_MEASURE_CLASSES = ("Measure", "DerivedMeasure")
 
-    Measure fields in read order: class, quantity, 0, food id, 0, measure id, 0,
-    description ref, HashMap (translations) + size, Measure$Type enum (first use:
-    class + ordinal; later uses: back-reference to the same value), weight.
-    All of a recipe's measures share one type, so the first ordinal seen is the setting.
+
+def _measures(tokens: list, table: list[str], food_id: int) -> tuple[int | None, dict[int, Measure]]:
+    """(first Measure$Type ordinal seen, {measure id: Measure}) for a food.
+
+    Measure / DerivedMeasure fields in read order:
+        quantity, flag, food id, 0, measure id, gram weight (Double or null), description ref,
+        translations (HashMap of Localization -> MeasureTranslation, or null),
+        Measure$Type enum (class + ordinal the first time, back-reference after), weight.
+    The food's own measures are found by their food id; any measure that doesn't decode
+    cleanly is skipped (it only affects how an amount is displayed).
     """
-    cls = _class_index(table, "com.cronometer.shared.foods.models.Measure/")
+    def cls(v) -> str | None:
+        return table[v - 1].split("/")[0].rsplit(".", 1)[-1] if isinstance(v, int) and 0 < v <= len(table) else None
+
+    def skip(i: int) -> int:
+        """Skip one serialized object (null, back-reference, or one of the translation classes)."""
+        t = tokens[i]
+        if not isinstance(t, int):
+            raise GwtError("expected object")
+        if t <= 0:
+            return i + 1
+        c = cls(t)
+        if c == "Localization":
+            return i + 2                      # class, language string
+        if c == "MeasureTranslation":
+            i = skip(i + 1)                   # Localization
+            return i + 3                      # measure id, translation id (long), description
+        if c == "Double":
+            return i + 2
+        raise GwtError(f"unexpected {c} in measure")
+
     kind: int | None = None
-    weights: dict[str, float] = {}
+    out: dict[int, Measure] = {}
     for p, v in enumerate(tokens):
-        if v != cls or p + 12 >= len(tokens) or tokens[p + 3] != food_id:
+        if cls(v) not in _MEASURE_CLASSES or p + 3 >= len(tokens) or tokens[p + 3] != food_id:
             continue
-        desc, size, enum = tokens[p + 7], tokens[p + 9], tokens[p + 10]
-        if not (isinstance(desc, int) and 1 <= desc <= len(table)) or size != 0 or not isinstance(enum, int):
+        try:
+            quantity, mid, i = tokens[p + 1], tokens[p + 5], skip(p + 6)
+            desc = tokens[i]
+            i += 1
+            t = tokens[i]
+            if isinstance(t, int) and t > 0 and cls(t) == "HashMap":
+                n, i = tokens[i + 1], i + 2
+                for _ in range(n):
+                    i = skip(skip(i))
+            else:
+                i = skip(i)
+            t = tokens[i]
+            if isinstance(t, int) and t > 0:  # enum class + ordinal
+                ordinal, i = tokens[i + 1], i + 2
+                if kind is None and isinstance(ordinal, int):
+                    kind = ordinal
+            else:
+                i += 1
+            weight = tokens[i]
+            if (isinstance(quantity, (int, float)) and isinstance(mid, int) and isinstance(desc, int)
+                    and 1 <= desc <= len(table) and isinstance(weight, (int, float))):
+                out.setdefault(mid, Measure(" ".join(table[desc - 1].split()), float(quantity), float(weight)))
+        except (GwtError, IndexError):
             continue
-        if enum > 0:
-            if kind is None and isinstance(tokens[p + 11], int):
-                kind = tokens[p + 11]
-            weight = tokens[p + 12]
-        else:
-            weight = tokens[p + 11]
-        if isinstance(weight, (int, float)):
-            weights.setdefault(table[desc - 1], float(weight))
-    return kind, weights
+    return kind, out

@@ -86,11 +86,18 @@ class _Foods:
         return food
 
 
+def _num(x: float) -> str:
+    return f"{x:.2f}".rstrip("0").rstrip(".")
+
+
 def _amount(s: Serving, f: Food) -> str:
-    servings = s.amount if f.per_unit else (s.amount / f.serving_weight if f.serving_weight else None)
-    if servings is not None:
-        return f"{servings:g} serving" + ("" if servings == 1 else "s")
-    return f"{s.amount:.1f} g".replace(".0 g", " g")
+    """Amount in the unit it was logged with, e.g. "1.25 cup", "3 each", "5 capsules"."""
+    m = f.measures.get(s.measure_id)
+    if m and m.weight > 0:
+        return f"{_num(s.amount / m.weight * m.quantity)} {m.description}"
+    if f.per_unit:
+        return f"{_num(s.amount)} serving" + ("" if s.amount == 1 else "s")
+    return f"{_num(s.amount)} g"
 
 
 def _build_day(day: date, servings: list[Serving], foods: _Foods, mode: str, fresh: bool):
@@ -98,6 +105,8 @@ def _build_day(day: date, servings: list[Serving], foods: _Foods, mode: str, fre
     day_sum: dict[int, float] = {}
     for s in sorted(servings, key=lambda s: (s.group, s.order)):
         f = foods.get(s.food_id, fresh=fresh)
+        if f is not None and s.measure_id and s.measure_id not in f.measures and s.food_id not in foods.fresh:
+            f = foods.get(s.food_id, fresh=True)  # cached copy predates this measure: refetch once
         m = meals.setdefault(s.group, {"sum": {}, "foods": []})
         if f is None:
             item = {"food": f"(food {s.food_id})", "amount": f"{s.amount:g} base units",

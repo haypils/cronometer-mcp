@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 TTL_SECONDS = 30 * 24 * 3600
 MAX_ENTRIES = 3000
-VERSION = 2  # v2: Food.custom replaced public_source
+VERSION = 3  # v3: Food.measures (display units)
 
 
 def default_path() -> Path:
