@@ -1,15 +1,19 @@
 """Read-only Cronometer client.
 
-Cronometer has no public API for individuals. This client uses the same
-calls the web app makes when you click "Export Data":
+Cronometer has no public API for individuals. This client uses calls the
+web app itself makes:
 
   1. GWT-RPC ``authenticate``               -> your numeric user id
   2. GWT-RPC ``generateAuthorizationToken`` -> short-lived export token
-  3. ``GET /export?generate=<type>``        -> CSV
+  3. ``GET /export?generate=<type>``        -> CSV ("Export Data")
+  4. GWT-RPC ``getServings``                -> diary entries for a date range
+  5. GWT-RPC ``getFood``                    -> one food's nutrient profile
+  6. GWT-RPC ``getTotalNutrients``          -> a day's official nutrient totals
 
 READ-ONLY BY CONSTRUCTION: the only POST this module can send is one of the
-two fixed RPC bodies in ``_RPC_BODIES``; everything else is a GET. There is
-no code path that can modify your diary.
+fixed RPC bodies in ``_RPC_BODIES``, all of which are reads; everything else
+is a GET. RPC parameters are integers only, so a body cannot be altered into a
+different call. There is no code path that can modify your diary.
 
 Protocol details adapted from cphoskins/cronometer-mcp (MIT, see
 THIRD_PARTY_LICENSE_cronometer-mcp).
@@ -25,7 +29,8 @@ from datetime import date, datetime
 
 import httpx
 
-from crono_mcp import auth
+from crono_mcp import auth, gwt
+from crono_mcp.exportlimit import ExportLimit
 
 logger = logging.getLogger(__name__)
 # httpx logs full URLs at INFO, which would include short-lived export tokens.
@@ -50,7 +55,10 @@ EXPORT_TYPES = {
     "notes": "notes",
 }
 
-# The ONLY RPC calls this client may make. Both are reads.
+_SVC = "https://cronometer.com/cronometer/|{gwt_header}|com.cronometer.shared.rpc.CronometerService|"
+_DAY = "com.cronometer.shared.entries.models.Day/782579793"
+
+# The ONLY RPC calls this client may make. All are reads.
 _RPC_BODIES = {
     "authenticate": (
         "7|0|5|https://cronometer.com/cronometer/|{gwt_header}|"
@@ -65,6 +73,26 @@ _RPC_BODIES = {
         "I|com.cronometer.shared.user.AuthScope/2065601159|"
         "{nonce}|1|2|3|4|4|5|6|6|7|8|{user_id}|3600|7|2|"
     ),
+    # getServings(nonce, userId, startDay, endDay, Time=null, Time=null)
+    "getServings": (
+        "7|0|9|" + _SVC + "getServings|java.lang.String/2004016611|I|" + _DAY + "|"
+        "com.cronometer.shared.entries.models.Time/1552252503|"
+        "{nonce}|1|2|3|4|6|5|6|7|7|8|8|9|{user_id}|"
+        "7|{d0}|{m0}|{y0}|7|{d1}|{m1}|{y1}|0|0|"
+    ),
+    # getFood(nonce, foodId)
+    "getFood": (
+        "7|0|7|" + _SVC + "getFood|java.lang.String/2004016611|I|"
+        "{nonce}|1|2|3|4|2|5|6|7|{food_id}|"
+    ),
+    # getTotalNutrients(nonce, userId, startDay, endDay, DayQueryType=0 (all days),
+    #                   includeEverything=true, sevenDayWindow=false)
+    "getTotalNutrients": (
+        "7|0|10|" + _SVC + "getTotalNutrients|java.lang.String/2004016611|I|" + _DAY + "|"
+        "com.cronometer.shared.entries.DayQueryType/1802942352|Z|"
+        "{nonce}|1|2|3|4|7|5|6|7|7|8|9|9|10|{user_id}|"
+        "7|{d0}|{m0}|{y0}|7|{d1}|{m1}|{y1}|8|0|1|0|"
+    ),
 }
 
 TIMEOUT = httpx.Timeout(60.0, connect=10.0)
@@ -78,14 +106,20 @@ class CronometerError(RuntimeError):
     pass
 
 
+class ExportLimitError(CronometerError):
+    """Cronometer's 10-exports-per-day limit is reached; the export was not attempted."""
+
+
 def _local_tz_offset_minutes() -> int:
     off = datetime.now().astimezone().utcoffset()
     return int(off.total_seconds() // 60) if off else 0
 
 
 class CronometerClient:
-    def __init__(self, cookies: dict[str, str] | None = None, *, persist: bool = True):
+    def __init__(self, cookies: dict[str, str] | None = None, *, persist: bool = True,
+                 export_limit: ExportLimit | None = None):
         self._persist = persist
+        self._export_limit = export_limit or ExportLimit(persist=persist)
         self._cookies: dict[str, str] | None = cookies
         self._http = httpx.Client(timeout=TIMEOUT, follow_redirects=False,
                                   headers={"User-Agent": "crono-mcp-readonly/0.1"})
@@ -152,9 +186,11 @@ class CronometerClient:
         except httpx.HTTPError as e:
             logger.warning("GWT hash discovery failed (%s); using fallbacks", type(e).__name__)
 
-    def _rpc(self, method: str) -> str:
+    def _rpc(self, method: str, **params: int) -> str:
         if method not in _RPC_BODIES:  # belt and braces: no other RPCs, ever
             raise CronometerError(f"RPC {method!r} is not permitted (read-only client)")
+        if not all(type(v) is int for v in params.values()):
+            raise CronometerError("RPC parameters must be integers")
         self._discover_hashes()
         cookies = self._ensure_cookies()
         body = _RPC_BODIES[method].format(
@@ -162,17 +198,21 @@ class CronometerClient:
             tz_offset=_local_tz_offset_minutes(),
             nonce=cookies.get(auth.SESSION_COOKIE, ""),
             user_id=self._user_id or "",
+            **params,
         )
-        r = self._http.post(
-            GWT_APP_URL,
-            content=body.encode(),
-            headers={
-                "content-type": "text/x-gwt-rpc; charset=UTF-8",
-                "x-gwt-module-base": GWT_MODULE_BASE,
-                "x-gwt-permutation": self._permutation,
-                "cookie": self._cookie_header(),
-            },
-        )
+        try:
+            r = self._http.post(
+                GWT_APP_URL,
+                content=body.encode(),
+                headers={
+                    "content-type": "text/x-gwt-rpc; charset=UTF-8",
+                    "x-gwt-module-base": GWT_MODULE_BASE,
+                    "x-gwt-permutation": self._permutation,
+                    "cookie": self._cookie_header(),
+                },
+            )
+        except httpx.HTTPError as e:
+            raise CronometerError(f"Cronometer RPC {method} failed ({type(e).__name__})") from e
         self._absorb_set_cookies(r)
         text = r.text
         if "NotLoggedInException" in text or r.status_code in (401, 403):
@@ -208,29 +248,63 @@ class CronometerClient:
             raise ValueError(f"export_type must be one of {sorted(EXPORT_TYPES)}")
         if end < start:
             raise ValueError("end date is before start date")
+        blocked = self._export_limit.blocked_reason()
+        if blocked:
+            raise ExportLimitError(blocked)
         token = self._export_token()
-        r = self._http.get(
-            EXPORT_URL,
-            params={
-                "nonce": token,
-                "generate": EXPORT_TYPES[export_type],
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-            },
-            headers={"cookie": self._cookie_header()},
-        )
+        try:
+            r = self._http.get(
+                EXPORT_URL,
+                params={
+                    "nonce": token,
+                    "generate": EXPORT_TYPES[export_type],
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+                headers={"cookie": self._cookie_header()},
+            )
+        except httpx.HTTPError as e:
+            raise CronometerError(f"Cronometer export failed ({type(e).__name__})") from e
         self._absorb_set_cookies(r)
         if r.status_code in (401, 403):
             raise AuthError("Cronometer rejected the export request (session expired?).")
+        if r.status_code == 429:
+            self._export_limit.record_rate_limited()
+            raise ExportLimitError("Cronometer's daily export limit (10/day) was reached; "
+                                   "exports paused for 24 hours.")
         if r.status_code >= 400:
             raise CronometerError(f"Cronometer export failed (HTTP {r.status_code})")
         text = r.text
         if text.lstrip().lower().startswith(("<!doctype", "<html")):
             raise AuthError("Cronometer returned a web page instead of CSV (session expired?).")
+        self._export_limit.record_success()
         return text
+
+    def export_budget(self) -> dict:
+        """Remaining exports under Cronometer's 10/day limit (no network)."""
+        return self._export_limit.status()
 
     def export_rows(self, export_type: str, start: date, end: date) -> list[dict[str, str]]:
         return parse_csv(self.export_csv(export_type, start, end))
+
+    # ---------- diary RPCs (read-only) ----------
+    @staticmethod
+    def _range_params(start: date, end: date) -> dict[str, int]:
+        if end < start:
+            raise ValueError("end date is before start date")
+        return {"d0": start.day, "m0": start.month, "y0": start.year,
+                "d1": end.day, "m1": end.month, "y1": end.year}
+
+    def servings(self, start: date, end: date) -> list[gwt.Serving]:
+        self._user()
+        return gwt.parse_servings(self._rpc("getServings", **self._range_params(start, end)))
+
+    def food(self, food_id: int) -> gwt.Food:
+        return gwt.parse_food(self._rpc("getFood", food_id=int(food_id)), int(food_id))
+
+    def total_nutrients(self, day: date) -> gwt.Totals:
+        self._user()
+        return gwt.parse_total_nutrients(self._rpc("getTotalNutrients", **self._range_params(day, day)))
 
     def close(self) -> None:
         self._http.close()

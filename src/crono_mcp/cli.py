@@ -1,4 +1,4 @@
-"""crono-mcp command line: auth | status | fetch | logout | serve."""
+"""crono-mcp command line: auth | status | fetch | foodlog | logout | serve."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import json
 import sys
 from datetime import date
 
-from crono_mcp import auth, shape
+from crono_mcp import auth, diary, shape
+from crono_mcp.foodcache import FoodCache
 from crono_mcp.client import AuthError, CronometerClient, CronometerError
 
 
@@ -22,7 +23,11 @@ def main() -> None:
     f.add_argument("start", nargs="?", default=date.today().isoformat())
     f.add_argument("end", nargs="?")
     f.add_argument("--raw", action="store_true", help="print raw CSV")
-    sub.add_parser("logout", help="Delete stored session from keychain")
+    fl = sub.add_parser("foodlog", help="Print per-food/per-meal nutrition from the diary")
+    fl.add_argument("start", nargs="?", default=date.today().isoformat())
+    fl.add_argument("end", nargs="?")
+    fl.add_argument("--all", action="store_true", help="all nutrients, not just key ones")
+    sub.add_parser("logout", help="Delete stored session from keychain and the food cache")
     sub.add_parser("serve", help="Run the MCP server (stdio)")
     args = p.parse_args()
 
@@ -32,7 +37,8 @@ def main() -> None:
         return
     if args.cmd == "logout":
         auth.clear()
-        print("Stored Cronometer session removed.")
+        FoodCache().clear()
+        print("Stored Cronometer session and food cache removed.")
         return
 
     client = CronometerClient()
@@ -52,7 +58,12 @@ def main() -> None:
                 out = shape.servings_by_day(rows) if args.type == "servings" else (
                     shape.daily_summaries(rows) if args.type == "daily_summary" else shape.compact_rows(rows))
                 print(json.dumps(out, indent=1))
-    except (AuthError, CronometerError) as e:
+        elif args.cmd == "foodlog":
+            d0 = date.fromisoformat(args.start)
+            d1 = date.fromisoformat(args.end) if args.end else d0
+            print(json.dumps(diary.food_log(client, FoodCache(), d0, d1, "all" if args.all else "key"),
+                             indent=1, ensure_ascii=False))
+    except (AuthError, CronometerError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
