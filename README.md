@@ -63,10 +63,18 @@ Session is saved in the macOS keychain (`crono-mcp-readonly`). Chrome is only ev
 cronometer.com in Chrome, then run `auth` again.
 
 ## If it breaks
-Cronometer deploys change GWT hashes; these are auto-discovered from
-`cronometer.nocache.js` / `<perm>.cache.js` each run. If RPCs start failing with
-`IncompatibleRemoteServiceException`, the RPC body format in `_RPC_BODIES` changed;
-compare against an upstream reference or the browser's network tab.
+Cronometer deploys change GWT build ids and, when a class changes, its type signature
+(`<class>/<hash>`). Both are read from `cronometer.nocache.js` / `<perm>.cache.js` on startup,
+and if Cronometer rejects a request as out of date (`IncompatibleRemoteServiceException`), they
+are re-read once and the request retried, so a deploy mid-session needs no restart.
+
+What can still break, and what you'll see:
+- A method's parameters change: still rejected after the retry. The food log falls back to
+  the export; fix the body in `_RPC_BODIES` (compare with the browser's network tab).
+- A response layout changes (fields added/reordered): `GwtError`, same fallback; fix the
+  decoder in `gwt.py`. One food that can't be decoded is listed without nutrients instead.
+- Scaling semantics change: every tracked nutrient is checked against Cronometer's day totals,
+  so the day is flagged `MISMATCH` with the nutrients that differ.
 
 ## Test
 ```

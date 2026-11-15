@@ -71,9 +71,6 @@ NAMES: dict[int, str] = {
 
 ENERGY, PROTEIN, CARBS, FAT = 208, 203, 205, 204
 
-# Nutrients used to check that summed foods match Cronometer's day totals.
-CHECK_IDS = (ENERGY, PROTEIN, CARBS, FAT, 291, 307)
-
 
 def named(values: dict[int, float]) -> dict[str, float]:
     """Map id-keyed values to export column names, dropping unmapped ids."""

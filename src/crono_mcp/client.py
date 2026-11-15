@@ -44,8 +44,8 @@ GWT_CACHE_JS_URL = f"{BASE}/cronometer/{{permutation}}.cache.js"
 EXPORT_URL = f"{BASE}/export"
 
 # Fallbacks only; discovered fresh from Cronometer's JS on first use.
-FALLBACK_PERMUTATION = "CBC38FBB0A1527BD5E68722DD9DABD27"
-FALLBACK_GWT_HEADER = "76FC4464E20E53D16663AC9A96A486B3"
+FALLBACK_PERMUTATION = "0EFF06F8710774B34D04BFA3409289E9"
+FALLBACK_GWT_HEADER = "B82D6F42004DB8749BB1C2080E1A4479"
 
 EXPORT_TYPES = {
     "servings": "servings",
@@ -56,40 +56,44 @@ EXPORT_TYPES = {
 }
 
 _SVC = "https://cronometer.com/cronometer/|{gwt_header}|com.cronometer.shared.rpc.CronometerService|"
-_DAY = "com.cronometer.shared.entries.models.Day/782579793"
+
+# GWT type signatures ("<class>/<hash>") used in request bodies. The hash changes when Cronometer
+# changes a class, so current values are read from the app's JavaScript on startup (see
+# _discover_hashes); these are only fallbacks, valid as of Nov 2026.
+FALLBACK_SIGNATURES = {
+    "t_string": "java.lang.String/2004016611",
+    "t_integer": "java.lang.Integer/3438268394",
+    "t_authscope": "com.cronometer.shared.user.AuthScope/2065601159",
+    "t_day": "com.cronometer.shared.entries.models.Day/782579793",
+    "t_time": "com.cronometer.shared.entries.models.Time/1552252503",
+    "t_dayquery": "com.cronometer.shared.entries.DayQueryType/1802942352",
+}
 
 # The ONLY RPC calls this client may make. All are reads.
 _RPC_BODIES = {
     "authenticate": (
-        "7|0|5|https://cronometer.com/cronometer/|{gwt_header}|"
-        "com.cronometer.shared.rpc.CronometerService|"
-        "authenticate|java.lang.Integer/3438268394|"
+        "7|0|5|" + _SVC + "authenticate|{t_integer}|"
         "1|2|3|4|1|5|5|{tz_offset}|"
     ),
     "generateAuthorizationToken": (
-        "7|0|8|https://cronometer.com/cronometer/|{gwt_header}|"
-        "com.cronometer.shared.rpc.CronometerService|"
-        "generateAuthorizationToken|java.lang.String/2004016611|"
-        "I|com.cronometer.shared.user.AuthScope/2065601159|"
+        "7|0|8|" + _SVC + "generateAuthorizationToken|{t_string}|I|{t_authscope}|"
         "{nonce}|1|2|3|4|4|5|6|6|7|8|{user_id}|3600|7|2|"
     ),
     # getServings(nonce, userId, startDay, endDay, Time=null, Time=null)
     "getServings": (
-        "7|0|9|" + _SVC + "getServings|java.lang.String/2004016611|I|" + _DAY + "|"
-        "com.cronometer.shared.entries.models.Time/1552252503|"
+        "7|0|9|" + _SVC + "getServings|{t_string}|I|{t_day}|{t_time}|"
         "{nonce}|1|2|3|4|6|5|6|7|7|8|8|9|{user_id}|"
         "7|{d0}|{m0}|{y0}|7|{d1}|{m1}|{y1}|0|0|"
     ),
     # getFood(nonce, foodId)
     "getFood": (
-        "7|0|7|" + _SVC + "getFood|java.lang.String/2004016611|I|"
+        "7|0|7|" + _SVC + "getFood|{t_string}|I|"
         "{nonce}|1|2|3|4|2|5|6|7|{food_id}|"
     ),
     # getTotalNutrients(nonce, userId, startDay, endDay, DayQueryType=0 (all days),
     #                   includeEverything=true, sevenDayWindow=false)
     "getTotalNutrients": (
-        "7|0|10|" + _SVC + "getTotalNutrients|java.lang.String/2004016611|I|" + _DAY + "|"
-        "com.cronometer.shared.entries.DayQueryType/1802942352|Z|"
+        "7|0|10|" + _SVC + "getTotalNutrients|{t_string}|I|{t_day}|{t_dayquery}|Z|"
         "{nonce}|1|2|3|4|7|5|6|7|7|8|9|9|10|{user_id}|"
         "7|{d0}|{m0}|{y0}|7|{d1}|{m1}|{y1}|8|0|1|0|"
     ),
@@ -104,6 +108,23 @@ class AuthError(RuntimeError):
 
 class CronometerError(RuntimeError):
     pass
+
+
+class _OutOfDate(Exception):
+    """Cronometer rejected a request built from stale build ids or type signatures."""
+
+
+def discover_signatures(js: str) -> dict[str, str]:
+    """Current "<class>/<hash>" type signatures from the app's JavaScript, with fallbacks."""
+    found = dict(FALLBACK_SIGNATURES)
+    for key, sig in FALLBACK_SIGNATURES.items():
+        cls = sig.rsplit("/", 1)[0]
+        m = re.search(r"'(" + re.escape(cls) + r"/\d+)'", js)
+        if m:
+            found[key] = m.group(1)
+        else:
+            logger.warning("Type signature for %s not found; using fallback", cls)
+    return found
 
 
 class ExportLimitError(CronometerError):
@@ -126,6 +147,7 @@ class CronometerClient:
         self._permutation = FALLBACK_PERMUTATION
         self._gwt_header = FALLBACK_GWT_HEADER
         self._hashes_discovered = False
+        self._signatures = dict(FALLBACK_SIGNATURES)
         self._user_id: str | None = None
 
     # ---------- cookies ----------
@@ -183,10 +205,22 @@ class CronometerClient:
                 self._gwt_header = h.group(1)
             else:
                 logger.warning("GWT header not found; using fallback")
+            self._signatures = discover_signatures(r.text)
         except httpx.HTTPError as e:
             logger.warning("GWT hash discovery failed (%s); using fallbacks", type(e).__name__)
 
     def _rpc(self, method: str, **params: int) -> str:
+        try:
+            return self._rpc_once(method, **params)
+        except _OutOfDate:
+            # Cronometer deployed since we read its JavaScript: rediscover once and retry.
+            self._hashes_discovered = False
+            try:
+                return self._rpc_once(method, **params)
+            except _OutOfDate as e:
+                raise CronometerError(f"Cronometer RPC {method} rejected as out of date: {e}") from e
+
+    def _rpc_once(self, method: str, **params: int) -> str:
         if method not in _RPC_BODIES:  # belt and braces: no other RPCs, ever
             raise CronometerError(f"RPC {method!r} is not permitted (read-only client)")
         if not all(type(v) is int for v in params.values()):
@@ -198,6 +232,7 @@ class CronometerClient:
             tz_offset=_local_tz_offset_minutes(),
             nonce=cookies.get(auth.SESSION_COOKIE, ""),
             user_id=self._user_id or "",
+            **self._signatures,
             **params,
         )
         try:
@@ -217,6 +252,8 @@ class CronometerClient:
         text = r.text
         if "NotLoggedInException" in text or r.status_code in (401, 403):
             raise AuthError("Cronometer session expired or invalid.")
+        if "IncompatibleRemoteServiceException" in text:
+            raise _OutOfDate(text[:200])
         if r.status_code >= 400 or not text.startswith("//OK"):
             # Response may include the IncompatibleRemoteService text that indicates a Cronometer deploy.
             raise CronometerError(f"Cronometer RPC {method} failed (HTTP {r.status_code}): {text[:200]}")

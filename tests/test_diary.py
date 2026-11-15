@@ -234,3 +234,24 @@ def test_custom_food_amount_shown_in_servings():
     s = gwt.Serving(date(2026, 1, 6), 1, 1, None, 150.0, 1, 0)
     assert diary._amount(s, label) == "1.5 servings"
     assert diary._amount(s, COFFEE) == "150 g"
+
+
+def test_undecodable_food_is_listed_without_nutrients(tmp_path):
+    class OneBad(FakeClient):
+        def food(self, fid):
+            if fid == 300001:
+                raise gwt.GwtError("odd food")
+            return super().food(fid)
+    c = OneBad({100001: COFFEE}, OFFICIAL)
+    [day] = diary.food_log(c, FoodCache(tmp_path / "f.json"), date(2026, 1, 5), date(2026, 1, 5))
+    coffee, = day["meals"][0]["foods"]
+    bad, = day["meals"][1]["foods"]
+    assert coffee["nutrients"]["Energy (kcal)"] == 4.0          # the rest still works
+    assert bad["nutrients"] == {} and "unavailable" in bad["error"]
+    assert day["check"] == "MISMATCH" and "1 food(s) could not be read" in day["note"]
+
+
+def test_micronutrient_mismatch_is_caught():
+    summed = {208: 100.0, 303: 2.0}
+    assert diary.mismatched(summed, {208: 100.0, 303: 2.0}) == []
+    assert diary.mismatched(summed, {208: 100.0, 303: 5.0}) == ["Iron (mg)"]
